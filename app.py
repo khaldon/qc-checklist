@@ -202,7 +202,16 @@ def make_tray_icon() -> QIcon:
     return QIcon(pm)
 
 
-MODAL = [0]   # > 0 while one of our dialogs is open (global hotkeys are ignored meanwhile)
+MODAL = [0]          # > 0 while one of our dialogs is open (global hotkeys are ignored meanwhile)
+TOPMOST_PAUSE = [0]  # > 0 while a menu is open: the overlay must not re-raise itself above it
+
+
+def make_menu_topmost(menu: "QMenu") -> None:
+    """Menus must be always-on-top too, otherwise the topmost toast overlay hides them."""
+    menu.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+    for a in menu.actions():
+        if a.menu() is not None:
+            make_menu_topmost(a.menu())
 
 
 def _run_dialog(dlg) -> bool:
@@ -338,7 +347,7 @@ class Overlay(QWidget):
 
     def keep_on_top(self) -> None:
         """Called every second: other apps (or 'topmost' apps) can't bury the overlay."""
-        if not self.isVisible():
+        if not self.isVisible() or MODAL[0] or TOPMOST_PAUSE[0]:
             return
         if sys.platform == "win32":
             try:
@@ -558,7 +567,7 @@ class Toast(QFrame):
 
     def _clicked(self, local: QPoint, global_pt: QPoint) -> None:
         if self.kind == "header":
-            self.mgr.build_menu(self).exec(global_pt)
+            self.mgr.popup_menu(self, global_pt)
             return
         pad = 5   # forgiving hit area around the small buttons
         if self.pbtn.geometry().adjusted(-pad, -pad, pad, pad).contains(local):
@@ -580,7 +589,7 @@ class Toast(QFrame):
         e.accept()
 
     def contextMenuEvent(self, e) -> None:  # noqa: N802
-        self.mgr.build_menu(self).exec(e.globalPos())
+        self.mgr.popup_menu(self, e.globalPos())
 
 
 # --------------------------------------------------------------------------- #
@@ -1079,7 +1088,10 @@ class Manager(QObject):
             self.tray.activated.connect(self._on_tray_activated)
             self.tray_menu = QMenu()
             self.tray_menu.setStyleSheet(MENU_STYLE)
-            self.tray_menu.aboutToShow.connect(lambda: self._fill_menu(self.tray_menu, None))
+            self.tray_menu.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+            self._tray_open = False
+            self.tray_menu.aboutToShow.connect(self._tray_menu_opening)
+            self.tray_menu.aboutToHide.connect(self._tray_menu_closing)
             self.tray.setContextMenu(self.tray_menu)
             self.tray.show()
 
@@ -1766,8 +1778,29 @@ class Manager(QObject):
         """Right-click / header-click menu."""
         m = QMenu()
         m.setStyleSheet(MENU_STYLE)
+        m.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
         self._fill_menu(m, toast)
         return m
+
+    def popup_menu(self, toast: Toast | None, global_pos: QPoint) -> None:
+        """Show the menu above the toasts; the overlay stops re-raising itself while it is open."""
+        m = self.build_menu(toast)
+        TOPMOST_PAUSE[0] += 1
+        try:
+            m.exec(global_pos)
+        finally:
+            TOPMOST_PAUSE[0] -= 1
+
+    def _tray_menu_opening(self) -> None:
+        self._fill_menu(self.tray_menu, None)
+        if not self._tray_open:
+            self._tray_open = True
+            TOPMOST_PAUSE[0] += 1
+
+    def _tray_menu_closing(self) -> None:
+        if self._tray_open:
+            self._tray_open = False
+            TOPMOST_PAUSE[0] -= 1
 
     def _fill_menu(self, m: QMenu, toast: Toast | None) -> None:
         """Populate a menu; rebuilt every time it opens so its state is always fresh."""
@@ -1844,6 +1877,9 @@ class Manager(QObject):
             m.addAction("Check for updates", lambda: self.updater.check(manual=True))
         m.addAction(f"Version {APP_VERSION}").setEnabled(False)
         m.addAction("Quit", lambda: self.quit())
+        for a in m.actions():                    # submenus created above must be topmost as well
+            if a.menu() is not None:
+                make_menu_topmost(a.menu())
 
 
 # --------------------------------------------------------------------------- #
