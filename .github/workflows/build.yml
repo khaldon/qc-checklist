@@ -1,0 +1,52 @@
+# Every push to main builds the Windows exe and publishes it as a GitHub Release.
+# Installed copies of the app notice the new release and update themselves.
+name: Build and release Windows exe
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ["**.md"]
+
+permissions:
+  contents: write   # needed to create the release
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: windows-latest
+    env:
+      VERSION: 1.0.${{ github.run_number }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install PyQt6 pyinstaller
+
+      - name: Stamp version into app.py
+        shell: pwsh
+        run: |
+          (Get-Content app.py) -replace '^APP_VERSION = .*', 'APP_VERSION = "${{ env.VERSION }}"' | Set-Content app.py -Encoding utf8
+
+      - name: Build exe
+        run: pyinstaller --noconsole --onefile --name QCChecklist app.py
+
+      - name: SHA-256 checksum
+        shell: pwsh
+        run: |
+          (Get-FileHash dist\QCChecklist.exe -Algorithm SHA256).Hash.ToLower() | Out-File -FilePath dist\QCChecklist.exe.sha256 -Encoding ascii -NoNewline
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ env.VERSION }}
+          name: QC Checklist v${{ env.VERSION }}
+          files: |
+            dist/QCChecklist.exe
+            dist/QCChecklist.exe.sha256
