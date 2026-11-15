@@ -23,7 +23,14 @@ Interaction
 * Drag a toast ............. move it anywhere (position remembered)
 * Mouse wheel on a toast ... change opacity of all toasts
 * Right-click a toast ...... Edit / Move up / Move down / Delete + global actions
+* Shift + drag any toast ... move ALL toasts together (to peek at what's behind them)
 * Tray icon (or right-click menu) -> Add item, Reset all, Re-stack, Opacity, Quit
+
+Global hotkeys (Windows; work while any other app has focus; editable in the JSON file)
+* Ctrl+Alt+Space ... tick the NEXT unchecked item and hide its toast
+* Ctrl+Alt+Z ....... undo: bring back the last item you ticked this way
+* Ctrl+Alt+H ....... show / hide all toasts
+* Ctrl+Alt+R ....... reset: untick everything and show all toasts (next arch)
 
 State is stored in ``qc_checklist_state.json`` next to this script / the executable.
 
@@ -51,7 +58,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-from PyQt6.QtCore import QEasingCurve, QObject, QPoint, QPropertyAnimation, QRect, Qt, QTimer, pyqtSignal, pyqtSlot
+from PyQt6.QtCore import QAbstractNativeEventFilter, QEasingCurve, QObject, QPoint, QPropertyAnimation, QRect, Qt, QTimer, pyqtSignal, pyqtSlot
 from PyQt6.QtGui import QAction, QActionGroup, QColor, QGuiApplication, QIcon, QPainter, QPainterPath, QPen, QPixmap, QRegion
 from PyQt6.QtWidgets import (
     QApplication,
@@ -80,9 +87,18 @@ TOAST_WIDTH = 300
 TOAST_GAP = 8
 DRAG_THRESHOLD = 6  # px of movement before a click becomes a drag
 
+# Global hotkeys (Windows). Format: modifiers+key, e.g. "ctrl+alt+space", "ctrl+shift+f9".
+# Override any of them in qc_checklist_state.json under "hotkeys".
+DEFAULT_HOTKEYS = {
+    "check_next": "ctrl+alt+space",   # tick next unchecked item + hide its toast
+    "undo": "ctrl+alt+z",             # restore the last item ticked with the hotkey
+    "toggle_visible": "ctrl+alt+h",   # show / hide all toasts
+    "reset": "ctrl+alt+r",            # untick all + show all
+}
+
 # --- auto-update settings ----------------------------------------------------
 APP_VERSION = "0.0.0"                         # stamped automatically by the CI build
-UPDATE_REPO = "https://github.com/khaldon/qc-checklist.git"    # <-- set this (public GitHub repo)
+UPDATE_REPO = "YOUR_GITHUB_USER/YOUR_REPO"    # <-- set this (public GitHub repo)
 ASSET_NAME = "QCChecklist.exe"                # release asset names (must match build.yml)
 API_URL = "https://api.github.com/repos/{repo}/releases/latest"
 REQUIRE_HTTPS = True
@@ -289,6 +305,8 @@ class Toast(QFrame):
         self._press: QPoint | None = None
         self._offset = QPoint()
         self._moved = False
+        self._move_all = False               # Shift+drag moves every toast
+        self._last = QPoint()
         self._anim: QPropertyAnimation | None = None
         self.setCursor(Qt.CursorShape.PointingHandCursor)
 
@@ -401,8 +419,12 @@ class Toast(QFrame):
     def mousePressEvent(self, e) -> None:  # noqa: N802
         if e.button() == Qt.MouseButton.LeftButton:
             self._press = e.globalPosition().toPoint()
+            self._last = self._press
             self._offset = self._press - self.global_pos()
             self._moved = False
+            self._move_all = bool(e.modifiers() & Qt.KeyboardModifier.ShiftModifier)
+            if self._move_all:
+                self.setCursor(Qt.CursorShape.SizeAllCursor)
             e.accept()
 
     def mouseMoveEvent(self, e) -> None:  # noqa: N802
@@ -413,7 +435,12 @@ class Toast(QFrame):
             if (gp - self._press).manhattanLength() < DRAG_THRESHOLD:
                 return
             self._moved = True
-            self._user_dragging = True
+            self._user_dragging = not self._move_all
+        if self._move_all:                                   # Shift+drag: move the whole group
+            d = gp - self._last
+            self._last = gp
+            self.mgr.move_all(d.x(), d.y())
+            return
         ov = self.mgr.overlay
         target = ov.mapFromGlobal(gp - self._offset)
         x = max(0, min(target.x(), ov.width() - self.width()))   # keep inside the desktop
@@ -425,11 +452,15 @@ class Toast(QFrame):
             if not self._moved and not self.hint:
                 self.mgr.toggle(self)
             elif self._moved:
-                self.custom_pos = True
+                if not self._move_all:
+                    self.custom_pos = True
                 self.mgr.schedule_save()
         self._press = None
         self._moved = False
         self._user_dragging = False
+        if self._move_all:
+            self._move_all = False
+            self.setCursor(Qt.CursorShape.PointingHandCursor)
 
     def moveEvent(self, e) -> None:  # noqa: N802
         super().moveEvent(e)
@@ -601,6 +632,99 @@ class Updater(QObject):
 
 
 # --------------------------------------------------------------------------- #
+# Global hotkeys (Windows RegisterHotKey)
+# --------------------------------------------------------------------------- #
+_VK_NAMED = {
+    "space": 0x20, "enter": 0x0D, "return": 0x0D, "tab": 0x09, "esc": 0x1B, "escape": 0x1B,
+    "backspace": 0x08, "insert": 0x2D, "delete": 0x2E, "home": 0x24, "end": 0x23,
+    "pageup": 0x21, "pagedown": 0x22, "left": 0x25, "up": 0x26, "right": 0x27, "down": 0x28,
+}
+_MODS = {"alt": 0x1, "ctrl": 0x2, "control": 0x2, "shift": 0x4, "win": 0x8, "meta": 0x8, "super": 0x8}
+
+
+def parse_hotkey(spec: str) -> tuple[int, int] | None:
+    """'ctrl+alt+space' -> (modifier flags, virtual-key code); None if invalid."""
+    if not isinstance(spec, str):
+        return None
+    mods, vk = 0, None
+    for part in (p.strip().lower() for p in spec.split("+")):
+        if not part:
+            return None
+        if part in _MODS:
+            mods |= _MODS[part]
+        elif vk is not None:
+            return None                                   # two non-modifier keys
+        elif part in _VK_NAMED:
+            vk = _VK_NAMED[part]
+        elif re.fullmatch(r"f([1-9]|1[0-9]|2[0-4])", part):
+            vk = 0x70 + int(part[1:]) - 1                 # F1..F24
+        elif re.fullmatch(r"num[0-9]", part):
+            vk = 0x60 + int(part[3:])                     # numpad digits
+        elif re.fullmatch(r"[a-z0-9]", part):
+            vk = ord(part.upper())
+        else:
+            return None
+    return (mods, vk) if vk is not None else None
+
+
+def pretty_hotkey(spec: str) -> str:
+    return "+".join(p.strip().capitalize() for p in spec.split("+"))
+
+
+class HotkeyFilter(QAbstractNativeEventFilter):
+    """Registers system-wide hotkeys and turns WM_HOTKEY messages into callbacks."""
+    WM_HOTKEY = 0x0312
+    MOD_NOREPEAT = 0x4000
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._callbacks: dict[int, Any] = {}
+        self._next_id = 1
+
+    def register(self, spec: str, callback) -> bool:
+        if sys.platform != "win32":
+            return False
+        parsed = parse_hotkey(spec)
+        if parsed is None:
+            return False
+        try:
+            import ctypes
+            mods, vk = parsed
+            hid = self._next_id
+            if not ctypes.windll.user32.RegisterHotKey(None, hid, mods | self.MOD_NOREPEAT, vk):
+                return False                              # usually: another app owns that combo
+            self._callbacks[hid] = callback
+            self._next_id += 1
+            return True
+        except Exception as exc:  # pragma: no cover - platform specific
+            print(f"[warn] RegisterHotKey failed: {exc}", file=sys.stderr)
+            return False
+
+    def unregister_all(self) -> None:
+        if sys.platform != "win32":
+            return
+        try:
+            import ctypes
+            for hid in list(self._callbacks):
+                ctypes.windll.user32.UnregisterHotKey(None, hid)
+        except Exception:  # pragma: no cover
+            pass
+        self._callbacks.clear()
+
+    def nativeEventFilter(self, event_type, message):  # noqa: N802
+        if sys.platform == "win32" and bytes(event_type) == b"windows_generic_MSG":
+            import ctypes
+            from ctypes import wintypes
+            msg = wintypes.MSG.from_address(int(message))
+            if msg.message == self.WM_HOTKEY:
+                cb = self._callbacks.get(msg.wParam)
+                if cb is not None:
+                    QTimer.singleShot(0, cb)              # run on the next event-loop turn
+                    return True, 0
+        return False, 0
+
+
+# --------------------------------------------------------------------------- #
 # Manager: owns the overlay, the toasts, the tray icon and persistence
 # --------------------------------------------------------------------------- #
 class Manager(QObject):
@@ -614,6 +738,24 @@ class Manager(QObject):
         self.hint_toast: Toast | None = None
         self.visible_all = True
         self.update_ready: str | None = None
+        self.check_history: list[Toast] = []       # toasts ticked via hotkey (for undo)
+        self._mask_blocked = False
+        self.origin: QPoint | None = None          # where the auto-stack starts (moved by Shift+drag)
+        o = state.get("origin")
+        if isinstance(o, list) and len(o) == 2:
+            try:
+                ox, oy = int(o[0]), int(o[1])
+                if self._on_screen(ox, oy):
+                    self.origin = QPoint(ox, oy)
+            except (TypeError, ValueError):
+                pass
+        self.hotkeys = dict(DEFAULT_HOTKEYS)
+        saved_hk = state.get("hotkeys")
+        if isinstance(saved_hk, dict):
+            for k in DEFAULT_HOTKEYS:
+                v = saved_hk.get(k)
+                if isinstance(v, str) and parse_hotkey(v):
+                    self.hotkeys[k] = v
 
         self._save_timer = QTimer(self)
         self._save_timer.setSingleShot(True)
@@ -644,6 +786,19 @@ class Manager(QObject):
         self._update_timer.timeout.connect(self.updater.check)
         self._update_timer.start()
 
+        # global hotkeys
+        self.hk = HotkeyFilter()
+        QApplication.instance().installNativeEventFilter(self.hk)
+        failed = []
+        for name, fn in (("check_next", self.check_next), ("undo", self.undo_check),
+                         ("toggle_visible", self.toggle_visible), ("reset", self.reset_all)):
+            if not self.hk.register(self.hotkeys[name], fn):
+                failed.append(pretty_hotkey(self.hotkeys[name]))
+        if failed and sys.platform == "win32":
+            QTimer.singleShot(2000, lambda: self._notify(
+                "Hotkey in use by another app (or invalid): " + ", ".join(failed)
+                + ". Change it in qc_checklist_state.json."))
+
         gui = QGuiApplication.instance()
         gui.screenAdded.connect(self.on_screens_changed)
         gui.screenRemoved.connect(self.on_screens_changed)
@@ -653,7 +808,8 @@ class Manager(QObject):
         self.restack()
         self.overlay.show()
         for t in self._all_toasts():
-            t.fade_in()
+            if not t.isHidden():
+                t.fade_in()
         self.refresh_mask()
         self._update_status()
 
@@ -690,16 +846,23 @@ class Manager(QObject):
                         pos = (x, y)
                 except (TypeError, ValueError):
                     pass
-            self.toasts.append(Toast(self, e["text"].strip(), bool(e.get("checked", False)), pos))
+            t = Toast(self, e["text"].strip(), bool(e.get("checked", False)), pos)
+            if t.checked and e.get("hidden"):          # only ticked items may stay hidden
+                t.hide()
+            self.toasts.append(t)
 
     def save(self) -> None:
+        o = self.origin
         data = {
-            "version": 3,
+            "version": 4,
             "opacity": self.opacity,
+            "origin": [o.x(), o.y()] if o is not None else None,
+            "hotkeys": self.hotkeys,
             "items": [
                 {
                     "text": t.text,
                     "checked": t.checked,
+                    "hidden": t.isHidden(),
                     "pos": [t.global_pos().x(), t.global_pos().y()] if t.custom_pos else None,
                 }
                 for t in self.toasts
@@ -712,27 +875,60 @@ class Manager(QObject):
 
     # ---------------------------------------------------------------- layout #
     def refresh_mask(self) -> None:
-        if hasattr(self, "overlay"):
+        if hasattr(self, "overlay") and not self._mask_blocked:
             self.overlay.refresh_mask()
 
-    def restack(self, reset_custom: bool = False) -> None:
-        """Stack auto-positioned toasts in a column at the top-right of the primary screen."""
-        screen = QApplication.primaryScreen()
-        area = screen.availableGeometry() if screen else None
-        x = (area.right() - TOAST_WIDTH - 20) if area else 40
-        y = (area.top() + 60) if area else 60
+    def _origin(self) -> QPoint:
+        """Top-left of the auto-stack (default: top-right of the primary screen)."""
+        if self.origin is None:
+            screen = QApplication.primaryScreen()
+            area = screen.availableGeometry() if screen else None
+            self.origin = QPoint((area.right() - TOAST_WIDTH - 20) if area else 40,
+                                 (area.top() + 60) if area else 60)
+        return self.origin
+
+    def restack(self, reset_custom: bool = False, reset_origin: bool = False) -> None:
+        """Stack visible, auto-positioned toasts in a column starting at the stack origin."""
+        if reset_origin:
+            self.origin = None
+        o = self._origin()
+        x, y = o.x(), o.y()
         n = 0
         for t in self._all_toasts():
             if reset_custom:
                 t.custom_pos = False
             t.fit()
             if not t.hint:
-                n += 1
+                n += 1                       # numbering counts hidden items too (stable step numbers)
                 t.set_index(n)
-            if t.custom_pos:
+            if t.isHidden() or t.custom_pos:
                 continue
             t.place(x, y)
             y += t.height() + TOAST_GAP
+        self.refresh_mask()
+        self.schedule_save()
+
+    def move_all(self, dx: int, dy: int) -> None:
+        """Move every toast (and the stack origin) by the same offset, keeping them on the desktop."""
+        everything = self._all_toasts()
+        vis = [t for t in everything if not t.isHidden()]
+        if not vis:
+            return
+        ov = self.overlay
+        left, top = min(t.x() for t in vis), min(t.y() for t in vis)
+        right, bottom = max(t.x() + t.width() for t in vis), max(t.y() + t.height() for t in vis)
+        dx = max(-left, min(dx, ov.width() - right))
+        dy = max(-top, min(dy, ov.height() - bottom))
+        if dx == 0 and dy == 0:
+            return
+        self._mask_blocked = True            # update the click-through mask once, not per toast
+        try:
+            for t in everything:
+                t.move(t.x() + dx, t.y() + dy)
+        finally:
+            self._mask_blocked = False
+        self._origin()
+        self.origin = self.origin + QPoint(dx, dy)
         self.refresh_mask()
         self.schedule_save()
 
@@ -745,13 +941,28 @@ class Manager(QObject):
         self.restack()
 
     def _update_hint(self) -> None:
-        """Show a hint toast only when there are no items (so there's always something to right-click)."""
-        if not self.toasts and self.hint_toast is None:
-            self.hint_toast = Toast(self, "No QC items.\nRight-click here to add one.", hint=True)
-        elif self.toasts and self.hint_toast is not None:
-            self.hint_toast.setParent(None)
-            self.hint_toast.deleteLater()
-            self.hint_toast = None
+        """Placeholder toast: shown when the list is empty, or when everything is ticked + hidden."""
+        want = None
+        if not self.toasts:
+            want = "No QC items.\nRight-click here to add one."
+        elif all(t.checked for t in self.toasts) and all(t.isHidden() for t in self.toasts):
+            want = f"✓ All checks complete\nReset: {pretty_hotkey(self.hotkeys['reset'])} or right-click"
+        if want is None:
+            if self.hint_toast is not None:
+                self.hint_toast.setParent(None)
+                self.hint_toast.deleteLater()
+                self.hint_toast = None
+        elif self.hint_toast is None:
+            self.hint_toast = Toast(self, want, hint=True)
+            self.restack()
+            if self.overlay.isVisible():
+                self.hint_toast.fade_in()
+        else:
+            self.hint_toast.set_text(want)
+
+    def _notify(self, msg: str) -> None:
+        if self.tray:
+            self.tray.showMessage(APP_TITLE, msg, QSystemTrayIcon.MessageIcon.Information, 5000)
 
     def _update_status(self) -> None:
         total = len(self.toasts)
@@ -764,9 +975,8 @@ class Manager(QObject):
         toast.set_checked(not toast.checked)
         self._update_status()
         self.schedule_save()
-        if self.toasts and all(t.checked for t in self.toasts) and self.tray:
-            self.tray.showMessage(APP_TITLE, "All checks complete ✓",
-                                  QSystemTrayIcon.MessageIcon.Information, 2500)
+        if self.toasts and all(t.checked for t in self.toasts):
+            self._notify("All checks complete ✓")
 
     def add_item(self) -> None:
         text = ask_text("Add QC item", "Check item:")
@@ -792,9 +1002,6 @@ class Manager(QObject):
             toast.setParent(None)        # detach immediately so it leaves the mask/overlay
             toast.deleteLater()
             self._update_hint()
-            if self.hint_toast is not None and self.visible_all:
-                self.restack()
-                self.hint_toast.fade_in()
             self.restack()
             self._update_status()
 
@@ -805,9 +1012,51 @@ class Manager(QObject):
             self.toasts[i], self.toasts[j] = self.toasts[j], self.toasts[i]
             self.restack(reset_custom=True)   # order == stacking order, so re-stack everything
 
+    def check_next(self) -> None:
+        """Hotkey: tick the first unchecked item (in list order) and hide its toast."""
+        nxt = next((t for t in self.toasts if not t.checked), None)
+        if nxt is None:
+            return
+        nxt.set_checked(True)
+        nxt.hide()
+        self.check_history.append(nxt)
+        self._after_hotkey_change()
+
+    def undo_check(self) -> None:
+        """Hotkey: bring back the most recently ticked item (unticked and visible again)."""
+        target = None
+        while self.check_history:
+            cand = self.check_history.pop()
+            if cand in self.toasts and cand.checked:
+                target = cand
+                break
+        if target is None:                                   # fallback: last ticked item in the list
+            target = next((t for t in reversed(self.toasts) if t.checked), None)
+        if target is None:
+            return
+        target.set_checked(False)
+        was_hidden = target.isHidden()
+        target.show()
+        self._after_hotkey_change()
+        if was_hidden and self.overlay.isVisible():
+            target.fade_in()
+
+    def _after_hotkey_change(self) -> None:
+        self._update_hint()
+        self.restack()                       # visible toasts close the gap / re-open the slot
+        self._update_status()
+        if self.toasts and all(t.checked for t in self.toasts):
+            self._notify("All checks complete ✓")
+
     def reset_all(self) -> None:
+        """Untick everything and show every toast again (next arch)."""
+        self.check_history.clear()
         for t in self.toasts:
             t.set_checked(False)
+            if t.isHidden():
+                t.show()
+        self._update_hint()
+        self.restack()
         self._update_status()
         self.schedule_save()
 
@@ -848,6 +1097,7 @@ class Manager(QObject):
 
     def quit(self) -> None:
         self.save()
+        self.hk.unregister_all()
         if self.tray:
             self.tray.hide()
         QApplication.quit()
@@ -876,11 +1126,14 @@ class Manager(QObject):
             down.setEnabled(idx < len(self.toasts) - 1)
             m.addAction("Delete", lambda: self.delete_item(toast))
             m.addSeparator()
+        hk = {k: pretty_hotkey(v) for k, v in self.hotkeys.items()}
         m.addAction("➕ Add item…", self.add_item)
-        m.addAction("↺ Reset all (untick)", self.reset_all)
-        m.addAction("Re-stack toasts", lambda: self.restack(reset_custom=True))
-        if self.tray:
-            m.addAction("Show / hide toasts", self.toggle_visible)
+        m.addAction(f"✓ Check next + hide    ({hk['check_next']})", self.check_next)
+        m.addAction(f"↶ Undo last check    ({hk['undo']})", self.undo_check)
+        m.addAction(f"↺ Reset all (untick + show)    ({hk['reset']})", self.reset_all)
+        m.addAction(f"Show / hide toasts    ({hk['toggle_visible']})", self.toggle_visible)
+        m.addAction("Re-stack toasts (default place)", lambda: self.restack(reset_custom=True, reset_origin=True))
+        m.addAction("Tip: Shift + drag = move all toasts").setEnabled(False)
 
         sub = m.addMenu("Opacity")
         group = QActionGroup(sub)
