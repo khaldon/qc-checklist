@@ -1,0 +1,26 @@
+{
+  "version": 3,
+  "opacity": 85,
+  "items": [
+    {
+      "text": "Third-molar trimming",
+      "checked": true,
+      "pos": null
+    },
+    {
+      "text": "Undercut blocking",
+      "checked": true,
+      "pos": null
+    },
+    {
+      "text": "Black triangles",
+      "checked": true,
+      "pos": null
+    },
+    {
+      "text": "Gingival margin finish",
+      "checked": true,
+      "pos": null
+    }
+  ]
+}
