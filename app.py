@@ -38,7 +38,8 @@ Auto-update (Windows .exe built by CI, see .github/workflows/build.yml)
 -----------------------------------------------------------------------
 On start (and every 6 h) the app asks GitHub Releases for a newer version, downloads
 QCChecklist.exe in the background, verifies its SHA-256, and applies it the next time
-the app starts (or immediately via tray menu -> "Restart to update").
+the app starts. "Check for updates" in the menu installs a newer version immediately
+(download -> restart). Background checks never interrupt you; they apply on next start.
 Set UPDATE_REPO below to "your-user/your-repo".
 
 Requires: Python 3.10+, PyQt6  ->  pip install PyQt6
@@ -98,7 +99,7 @@ DEFAULT_HOTKEYS = {
 
 # --- auto-update settings ----------------------------------------------------
 APP_VERSION = "0.0.0"                         # stamped automatically by the CI build
-UPDATE_REPO = "YOUR_GITHUB_USER/YOUR_REPO"    # <-- set this (public GitHub repo)
+UPDATE_REPO = "https://github.com/khaldon/qc-checklist.git"    # <-- set this (public GitHub repo)
 ASSET_NAME = "QCChecklist.exe"                # release asset names (must match build.yml)
 API_URL = "https://api.github.com/repos/{repo}/releases/latest"
 REQUIRE_HTTPS = True
@@ -551,7 +552,7 @@ def launch_updater(new_file: Path) -> bool:
 
 class Updater(QObject):
     status = pyqtSignal(str)   # human-readable message for the tray balloon
-    ready = pyqtSignal(str)    # emitted with the version once an update is downloaded + verified
+    ready = pyqtSignal(str, bool)   # (version, was_manual) once an update is downloaded + verified
 
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
@@ -594,7 +595,7 @@ class Updater(QObject):
         ver = ".".join(map(str, latest))
 
         if self.pending_file is not None and ver in self.pending_file.name:
-            self.ready.emit(ver)
+            self.ready.emit(ver, manual)
             return
         if not is_frozen():
             self.status.emit(f"Version {ver} is available (running from source: not auto-installing).")
@@ -604,6 +605,8 @@ class Updater(QObject):
         exe_url, sha_url = assets.get(ASSET_NAME), assets.get(ASSET_NAME + ".sha256")
         if not exe_url or not sha_url:
             raise RuntimeError("release is missing the exe or its .sha256 checksum")
+        if manual:
+            self.status.emit(f"Downloading update v{ver}…")
         with _open_url(sha_url, "application/octet-stream") as r:
             expected = r.read().decode("ascii", "ignore").split()[0].strip().lower()
 
@@ -628,7 +631,7 @@ class Updater(QObject):
                 except OSError:
                     pass
         self.pending_file = dest
-        self.ready.emit(ver)
+        self.ready.emit(ver, manual)
 
 
 # --------------------------------------------------------------------------- #
@@ -1078,9 +1081,13 @@ class Manager(QObject):
         if msg and self.tray:
             self.tray.showMessage(APP_TITLE, msg, QSystemTrayIcon.MessageIcon.Information, 4000)
 
-    @pyqtSlot(str)
-    def _on_update_ready(self, ver: str) -> None:
+    @pyqtSlot(str, bool)
+    def _on_update_ready(self, ver: str, manual: bool) -> None:
         self.update_ready = ver
+        if manual:                       # "Check for updates" clicked -> install right away
+            self._notify(f"Installing v{ver} and restarting…")
+            self.apply_update()
+            return
         if self.tray:
             self.tray.showMessage(APP_TITLE, f"Update v{ver} downloaded. It installs on next start, "
                                   "or use the tray menu: Restart to update.",
