@@ -1,38 +1,40 @@
 #!/usr/bin/env python3
 """
-QC Toast Checklist  (single-overlay version)
-============================================
-Every QC check item is its own small, semi-transparent "toast" floating above
-every other application (e.g. your 3D dental-arch viewer).
+QC Toast Checklist for 3D dental-arch reviews
+=============================================
+Semi-transparent, always-on-top "toasts" floating over every other application
+(e.g. your 3D viewer). One toast per QC check, each with a Pass (✓) and Fail (✗) button,
+plus a header toast showing the OPERATOR and the CASE you are checking.
 
-How it is built (why it behaves well)
--------------------------------------
-* ALL toasts live inside ONE transparent, frameless, always-on-top overlay window
-  that spans the desktop. The OS therefore sees a single tool window, not one per
-  toast -> nothing extra in Alt-Tab / Ctrl-Tab / taskbar.
-* The empty parts of the overlay are masked out, so mouse clicks pass straight
-  through to the application underneath. Only the toast cards catch the mouse.
-* Transparency/fade is rendered by Qt itself (per-toast opacity effect), not by the
-  OS window-opacity feature, so it works the same everywhere.
-* Toasts never take keyboard focus, so your 3D software keeps working normally.
-* The overlay re-asserts "topmost" every second so other apps can't bury it.
+The 8 checks: case version number, mismatch, B grade note, attachment processing,
+tooth numbering, axis, arch curve, extra material and undercut.
 
-Interaction
------------
-* Click a toast ............ tick / untick (strikethrough when done)
-* Drag a toast ............. move it anywhere (position remembered)
-* Mouse wheel on a toast ... change opacity of all toasts
-* Right-click a toast ...... Edit / Move up / Move down / Delete + global actions
-* Shift + drag any toast ... move ALL toasts together (to peek at what's behind them)
-* Tray icon (or right-click menu) -> Add item, Reset all, Re-stack, Opacity, Quit
+Workflow
+--------
+1. Create an operator (menu -> Operator -> New operator), then paste that operator's case numbers.
+2. Judge the 8 checks with the hotkeys (or click the ✓ / ✗ buttons on the toasts).
+3. When all 8 are judged, the case is saved as one row in your GOOGLE SHEET
+   (date, time, operator, case, each check, passed/failed, PASS/FAIL). Set it up once:
+   menu -> "Connect Google Sheet..." (see google_apps_script/Code.gs). Without it the
+   rows go to a local qc_results.xlsx instead.
+4. Press the Next-case hotkey: the operator's next unfinished case loads.
+Each operator has their own cases and their own Pass/Fail status for the same checklist.
 
-Global hotkeys (Windows; work while any other app has focus; editable in the JSON file)
-* Ctrl+Alt+Space ... tick the NEXT unchecked item and hide its toast
-* Ctrl+Alt+Z ....... undo: bring back the last item you ticked this way
-* Ctrl+Alt+H ....... show / hide all toasts
-* Ctrl+Alt+R ....... reset: untick everything and show all toasts (next arch)
+Mouse
+-----
+* Click ✓ / ✗ on a toast ... Pass / Fail that item (click again to clear)
+* Click the header toast .. menu (operators, cases, ...)    * Right-click any toast ... same menu
+* Drag a toast ............ move it          * Shift + drag ...... move ALL toasts together
+* Mouse wheel on a toast .. opacity of all toasts
 
-State is stored in ``qc_checklist_state.json`` next to this script / the executable.
+Global hotkeys (Windows; work while another app has focus; editable in qc_checklist_state.json)
+* Ctrl+Alt+Space .. PASS the next item   * Ctrl+Alt+X .. FAIL the next item   * Ctrl+Alt+Z .. undo
+* Ctrl+Alt+N ..... next case             * Ctrl+Alt+H .. show/hide toasts     * Ctrl+Alt+R .. reset case
+(The next item to be judged has a yellow outline.)
+
+Files next to the exe: qc_checklist_state.json (operators, cases, statuses, Google connection) and,
+only when no Google Sheet is connected, qc_results.xlsx. If the sheet can't be reached (offline,
+file open in Excel) rows are kept and re-sent automatically, even after a restart.
 
 Auto-update (Windows .exe built by CI, see .github/workflows/build.yml)
 -----------------------------------------------------------------------
@@ -42,12 +44,14 @@ the app starts. "Check for updates" in the menu installs a newer version immedia
 (download -> restart). Background checks never interrupt you; they apply on next start.
 Set UPDATE_REPO below to "your-user/your-repo".
 
-Requires: Python 3.10+, PyQt6  ->  pip install PyQt6
+Requires: Python 3.10+, PyQt6, openpyxl  ->  pip install -r requirements.txt
 """
 
 from __future__ import annotations
 
+import csv
 import hashlib
+import html
 import json
 import os
 import re
@@ -55,12 +59,14 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import urllib.request
 from pathlib import Path
+from datetime import datetime
 from typing import Any
 
-from PyQt6.QtCore import QAbstractNativeEventFilter, QEasingCurve, QObject, QPoint, QPropertyAnimation, QRect, Qt, QTimer, pyqtSignal, pyqtSlot
-from PyQt6.QtGui import QAction, QActionGroup, QColor, QGuiApplication, QIcon, QPainter, QPainterPath, QPen, QPixmap, QRegion
+from PyQt6.QtCore import QAbstractNativeEventFilter, QEasingCurve, QObject, QPoint, QPropertyAnimation, QRect, Qt, QTimer, QUrl, pyqtSignal, pyqtSlot
+from PyQt6.QtGui import QAction, QActionGroup, QColor, QDesktopServices, QGuiApplication, QIcon, QPainter, QPainterPath, QPen, QPixmap, QRegion
 from PyQt6.QtWidgets import (
     QApplication,
     QFrame,
@@ -69,6 +75,7 @@ from PyQt6.QtWidgets import (
     QInputDialog,
     QLabel,
     QMenu,
+    QMessageBox,
     QSystemTrayIcon,
     QVBoxLayout,
     QWidget,
@@ -76,34 +83,45 @@ from PyQt6.QtWidgets import (
 
 APP_TITLE = "QC Toast Checklist"
 STATE_FILENAME = "qc_checklist_state.json"
-DEFAULT_ITEMS = [
-    "Third-molar trimming",
-    "Undercut blocking",
-    "Black triangles",
-    "Gingival margin finish",
+DEFAULT_CHECKLIST = [
+    "Case version number",
+    "Mismatch",
+    "B grade note",
+    "Attachment processing",
+    "Tooth numbering",
+    "Axis",
+    "Arch curve",
+    "Extra material and undercut",
 ]
 DEFAULT_OPACITY = 85
 MIN_OPACITY = 30
-TOAST_WIDTH = 300
+TOAST_WIDTH = 340
+BTN_SIZE = 26       # Pass / Fail button size (px)
 TOAST_GAP = 8
 DRAG_THRESHOLD = 6  # px of movement before a click becomes a drag
 
 # Global hotkeys (Windows). Format: modifiers+key, e.g. "ctrl+alt+space", "ctrl+shift+f9".
 # Override any of them in qc_checklist_state.json under "hotkeys".
 DEFAULT_HOTKEYS = {
-    "check_next": "ctrl+alt+space",   # tick next unchecked item + hide its toast
-    "undo": "ctrl+alt+z",             # restore the last item ticked with the hotkey
+    "pass": "ctrl+alt+space",         # PASS the next unjudged item
+    "fail": "ctrl+alt+x",             # FAIL the next unjudged item
+    "undo": "ctrl+alt+z",             # clear the last judgment
+    "next_case": "ctrl+alt+n",        # load the operator's next unfinished case
     "toggle_visible": "ctrl+alt+h",   # show / hide all toasts
-    "reset": "ctrl+alt+r",            # untick all + show all
+    "reset": "ctrl+alt+r",            # clear all marks of the current case
 }
 
 # --- auto-update settings ----------------------------------------------------
 APP_VERSION = "0.0.0"                         # stamped automatically by the CI build
-UPDATE_REPO = "https://github.com/khaldon/qc-checklist.git"    # <-- set this (public GitHub repo)
+UPDATE_REPO = "YOUR_GITHUB_USER/YOUR_REPO"    # <-- set this (public GitHub repo)
 ASSET_NAME = "QCChecklist.exe"                # release asset names (must match build.yml)
 API_URL = "https://api.github.com/repos/{repo}/releases/latest"
 REQUIRE_HTTPS = True
 UPDATE_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000  # re-check every 6 hours
+
+# --- Google Sheet -----------------------------------------------------------
+GOOGLE_SHEET_URL = "https://docs.google.com/spreadsheets/d/159GgHct3sJ-hU3QAlL2hNHqwoB1Js6H3BoIp41J9c7E/edit"
+GOOGLE_WEBAPP_PREFIX = "https://script.google.com/macros/s/"   # Apps Script web-app URLs start like this
 
 
 # --------------------------------------------------------------------------- #
@@ -184,6 +202,17 @@ def make_tray_icon() -> QIcon:
     return QIcon(pm)
 
 
+MODAL = [0]   # > 0 while one of our dialogs is open (global hotkeys are ignored meanwhile)
+
+
+def _run_dialog(dlg) -> bool:
+    MODAL[0] += 1
+    try:
+        return bool(dlg.exec())
+    finally:
+        MODAL[0] -= 1
+
+
 def ask_text(title: str, label: str, text: str = "") -> str | None:
     """Small always-on-top text prompt (so it isn't hidden behind the 3D viewer)."""
     dlg = QInputDialog()
@@ -192,9 +221,47 @@ def ask_text(title: str, label: str, text: str = "") -> str | None:
     dlg.setLabelText(label)
     dlg.setTextValue(text)
     dlg.setMinimumWidth(360)
-    if dlg.exec() and dlg.textValue().strip():
+    if _run_dialog(dlg) and dlg.textValue().strip():
         return dlg.textValue().strip()
     return None
+
+
+def ask_multiline(title: str, label: str) -> str | None:
+    """Multi-line prompt (used to paste a list of case numbers)."""
+    dlg = QInputDialog()
+    dlg.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+    dlg.setOption(QInputDialog.InputDialogOption.UsePlainTextEditForTextInput, True)
+    dlg.setWindowTitle(title)
+    dlg.setLabelText(label)
+    dlg.resize(420, 320)
+    if _run_dialog(dlg) and dlg.textValue().strip():
+        return dlg.textValue().strip()
+    return None
+
+
+def confirm(title: str, text: str) -> bool:
+    """Always-on-top Yes/No question (default: No)."""
+    box = QMessageBox()
+    box.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+    box.setIcon(QMessageBox.Icon.Question)
+    box.setWindowTitle(title)
+    box.setText(text)
+    yes = box.addButton("Yes", QMessageBox.ButtonRole.YesRole)
+    no = box.addButton("No", QMessageBox.ButtonRole.NoRole)
+    box.setDefaultButton(no)
+    _run_dialog(box)
+    return box.clickedButton() is yes
+
+
+def info(title: str, text: str) -> None:
+    """Always-on-top OK message."""
+    box = QMessageBox()
+    box.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+    box.setIcon(QMessageBox.Icon.Information)
+    box.setWindowTitle(title)
+    box.setText(text)
+    box.addButton("OK", QMessageBox.ButtonRole.AcceptRole)
+    _run_dialog(box)
 
 
 def repolish(w: QWidget) -> None:
@@ -292,24 +359,32 @@ class Overlay(QWidget):
 
 
 # --------------------------------------------------------------------------- #
-# One toast == one checklist item  (a child widget of the overlay)
+# One toast (a child widget of the overlay): the header toast or a checklist-item toast
 # --------------------------------------------------------------------------- #
 class Toast(QFrame):
-    def __init__(self, mgr: "Manager", text: str, checked: bool = False,
-                 pos: tuple[int, int] | None = None, hint: bool = False) -> None:
+    """kind == "header": operator + case + progress (click it for the menu).
+    kind == "item":   one checklist item with a Pass (✓) and a Fail (✗) button."""
+
+    def __init__(self, mgr: "Manager", kind: str, key: Any, text: str = "", index: int = 0,
+                 pos: tuple[int, int] | None = None) -> None:
         super().__init__(mgr.overlay)
         self.mgr = mgr
-        self.hint = hint                      # placeholder toast shown when the list is empty
-        self.checked = checked
-        self.custom_pos = pos is not None     # True once the user has placed it manually
+        self.kind = kind
+        self.key = key
+        self.status: str | None = None        # None | "pass" | "fail"
+        self.is_current = False               # the item the Pass/Fail hotkeys will judge next
+        self.custom_pos = pos is not None     # True once the user placed it manually
         self._user_dragging = False
         self._press: QPoint | None = None
+        self._press_local = QPoint()
         self._offset = QPoint()
         self._moved = False
-        self._move_all = False               # Shift+drag moves every toast
+        self._move_all = False                # Shift+drag moves every toast
         self._last = QPoint()
         self._anim: QPropertyAnimation | None = None
-        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._base_cursor = (Qt.CursorShape.PointingHandCursor if kind == "header"
+                             else Qt.CursorShape.ArrowCursor)
+        self.setCursor(self._base_cursor)
 
         # Qt-rendered transparency (reliable on every platform)
         self.effect = QGraphicsOpacityEffect(self)
@@ -320,36 +395,48 @@ class Toast(QFrame):
         outer.setContentsMargins(0, 0, 0, 0)
         self.card = QFrame()
         self.card.setObjectName("card")
+        self.card.setProperty("kind", kind)
+        self.card.setProperty("state", "none")
+        self.card.setProperty("current", "false")
         outer.addWidget(self.card)
 
         row = QHBoxLayout(self.card)
         row.setContentsMargins(10, 8, 12, 8)
         row.setSpacing(10)
 
-        self.num = QLabel("")
-        self.num.setObjectName("num")
-        self.num.setFixedWidth(16)
-        self.box = QLabel("")
-        self.box.setObjectName("box")
-        self.box.setFixedSize(22, 22)
-        self.box.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.label = QLabel(text)
         self.label.setObjectName("text")
         self.label.setWordWrap(True)
+        self.label.setTextFormat(Qt.TextFormat.RichText if kind == "header" else Qt.TextFormat.PlainText)
+        self.num = self.pbtn = self.fbtn = None
+        widgets = [self.card, self.label]
+
+        if kind == "item":
+            self.num = QLabel(str(index))
+            self.num.setObjectName("num")
+            self.num.setFixedWidth(18)
+            self.pbtn, self.fbtn = QLabel("✓"), QLabel("✗")
+            for b, name in ((self.pbtn, "pbtn"), (self.fbtn, "fbtn")):
+                b.setObjectName(name)
+                b.setFixedSize(BTN_SIZE, BTN_SIZE)
+                b.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                b.setProperty("active", "false")
+            row.addWidget(self.num)
+            row.addWidget(self.label, 1)
+            btns = QHBoxLayout()
+            btns.setSpacing(4)
+            btns.addWidget(self.pbtn)
+            btns.addWidget(self.fbtn)
+            row.addLayout(btns)
+            widgets += [self.num, self.pbtn, self.fbtn]
+        else:
+            row.addWidget(self.label, 1)
+
         # Mouse events fall through to the toast so click/drag work anywhere on it.
-        for w in (self.num, self.box, self.label, self.card):
+        for w in widgets:
             w.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
 
-        if hint:
-            self.num.hide()
-            self.box.hide()
-        else:
-            row.addWidget(self.num)
-            row.addWidget(self.box)
-        row.addWidget(self.label, 1)
-
         self.setStyleSheet(TOAST_STYLE)
-        self._refresh_style()
         self.fit()
         if pos is not None:
             self.place(*pos)
@@ -359,34 +446,39 @@ class Toast(QFrame):
     def text(self) -> str:
         return self.label.text()
 
-    def set_text(self, text: str) -> None:
-        self.label.setText(text)
+    def set_status(self, status: str | None) -> None:
+        self.status = status
+        self._refresh_props()
+
+    def set_current(self, flag: bool) -> None:
+        self.is_current = flag
+        self._refresh_props()
+
+    def set_info(self, html_text: str, state: str) -> None:
+        """Header toast: rich text + colour state (none / progress / pass / fail)."""
+        self.label.setText(html_text)
+        self.card.setProperty("state", state)
+        repolish(self.card)
         self.fit()
 
-    def set_index(self, n: int) -> None:
-        self.num.setText(str(n))
-
-    def set_checked(self, checked: bool) -> None:
-        self.checked = checked
-        self._refresh_style()
-
-    def _refresh_style(self) -> None:
-        done = self.checked and not self.hint
-        for w in (self.card, self.box, self.label):
-            w.setProperty("done", "true" if done else "false")
+    def _refresh_props(self) -> None:
+        if self.kind != "item":
+            return
+        st = self.status or "none"
+        self.card.setProperty("state", st)
+        self.card.setProperty("current", "true" if (self.is_current and self.status is None) else "false")
+        self.pbtn.setProperty("active", "true" if st == "pass" else "false")
+        self.fbtn.setProperty("active", "true" if st == "fail" else "false")
+        for w in (self.card, self.pbtn, self.fbtn):
             repolish(w)
-        self.box.setText("✓" if done else "")
-        f = self.label.font()
-        f.setStrikeOut(done)
-        self.label.setFont(f)
 
     def fit(self) -> None:
         """Fixed width; height follows the word-wrapped text (computed explicitly for reliability)."""
-        avail = TOAST_WIDTH - 10 - 12 - 6          # card margins + border
+        avail = TOAST_WIDTH - 10 - 12 - 6                  # card margins + border
         min_h = 0
-        if not self.hint:
-            avail -= 16 + 22 + 2 * 10              # number + box + spacings
-            min_h = 22
+        if self.kind == "item":
+            avail -= 18 + (2 * BTN_SIZE + 4) + 2 * 10      # number + buttons + spacings
+            min_h = BTN_SIZE
         text_h = self.label.heightForWidth(max(avail, 50))
         if text_h <= 0:
             text_h = self.label.sizeHint().height()
@@ -420,6 +512,7 @@ class Toast(QFrame):
     def mousePressEvent(self, e) -> None:  # noqa: N802
         if e.button() == Qt.MouseButton.LeftButton:
             self._press = e.globalPosition().toPoint()
+            self._press_local = e.position().toPoint()
             self._last = self._press
             self._offset = self._press - self.global_pos()
             self._moved = False
@@ -450,9 +543,9 @@ class Toast(QFrame):
 
     def mouseReleaseEvent(self, e) -> None:  # noqa: N802
         if e.button() == Qt.MouseButton.LeftButton and self._press is not None:
-            if not self._moved and not self.hint:
-                self.mgr.toggle(self)
-            elif self._moved:
+            if not self._moved:
+                self._clicked(self._press_local, e.globalPosition().toPoint())
+            else:
                 if not self._move_all:
                     self.custom_pos = True
                 self.mgr.schedule_save()
@@ -461,7 +554,17 @@ class Toast(QFrame):
         self._user_dragging = False
         if self._move_all:
             self._move_all = False
-            self.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.setCursor(self._base_cursor)
+
+    def _clicked(self, local: QPoint, global_pt: QPoint) -> None:
+        if self.kind == "header":
+            self.mgr.build_menu(self).exec(global_pt)
+            return
+        pad = 5   # forgiving hit area around the small buttons
+        if self.pbtn.geometry().adjusted(-pad, -pad, pad, pad).contains(local):
+            self.mgr.toggle_status(self.key, "pass")
+        elif self.fbtn.geometry().adjusted(-pad, -pad, pad, pad).contains(local):
+            self.mgr.toggle_status(self.key, "fail")
 
     def moveEvent(self, e) -> None:  # noqa: N802
         super().moveEvent(e)
@@ -728,22 +831,195 @@ class HotkeyFilter(QAbstractNativeEventFilter):
 
 
 # --------------------------------------------------------------------------- #
-# Manager: owns the overlay, the toasts, the tray icon and persistence
+# Results sheet (Excel .xlsx; falls back to .csv if openpyxl is not installed)
+# --------------------------------------------------------------------------- #
+def today_str() -> str:
+    return datetime.now().strftime("%Y-%m-%d")
+
+
+def now_iso() -> str:
+    return datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def _norm(v: Any) -> str:
+    if hasattr(v, "strftime"):
+        return v.strftime("%Y-%m-%d")
+    return "" if v is None else str(v).strip()
+
+
+class ResultsSheet:
+    """One row per (date, operator, case). Re-saving the same case updates its row."""
+    FIXED = ["Date", "Time", "Operator", "Case number"]
+    TAIL = ["Passed", "Failed", "Result"]
+    FILLS = {"Pass": "C6EFCE", "PASS": "C6EFCE", "Fail": "FFC7CE", "FAIL": "FFC7CE", "INCOMPLETE": "FFEB9C"}
+
+    def __init__(self, directory: Path, item_texts: list[str]) -> None:
+        self.headers = self.make_headers(item_texts)
+        try:
+            import openpyxl  # noqa: F401
+            self.use_xlsx = True
+        except ImportError:
+            self.use_xlsx = False
+        self.path = directory / ("qc_results.xlsx" if self.use_xlsx else "qc_results.csv")
+        self.label = self.path.name
+        self.is_google = False
+
+    @classmethod
+    def make_headers(cls, item_texts: list[str]) -> list[str]:
+        return cls.FIXED + item_texts + cls.TAIL
+
+    @staticmethod
+    def key(row: list[Any]) -> tuple[str, str, str]:
+        return (_norm(row[0]), _norm(row[2]), _norm(row[3]))
+
+    def _rotate(self) -> None:
+        """Checklist changed -> keep the old file and start a fresh sheet."""
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        try:
+            self.path.replace(self.path.with_name(f"{self.path.stem}_old_{stamp}{self.path.suffix}"))
+        except OSError:
+            pass
+
+    def upsert(self, rows: list[list[Any]]) -> None:
+        (self._upsert_xlsx if self.use_xlsx else self._upsert_csv)(rows)
+
+    def _upsert_xlsx(self, rows: list[list[Any]]) -> None:
+        from openpyxl import Workbook, load_workbook
+        from openpyxl.styles import Alignment, Font, PatternFill
+
+        wb = None
+        if self.path.exists():
+            wb = load_workbook(self.path)
+            if [c.value for c in wb.active[1]] != self.headers:
+                wb.close()
+                self._rotate()
+                wb = None
+        if wb is None:
+            wb = Workbook()
+            ws = wb.active
+            ws.title = "QC Results"
+            ws.append(self.headers)
+            for c in ws[1]:
+                c.font = Font(bold=True)
+                c.alignment = Alignment(wrap_text=True, vertical="center")
+            ws.freeze_panes = "A2"
+            for i in range(1, len(self.headers) + 1):
+                ws.column_dimensions[ws.cell(1, i).column_letter].width = 12 if i <= 2 else 18
+        ws = wb.active
+        index = {self.key([ws.cell(r, c).value for c in (1, 2, 3, 4)]): r for r in range(2, ws.max_row + 1)}
+        for row in rows:
+            r = index.get(self.key(row))
+            if r is None:
+                ws.append(row)
+                r = ws.max_row
+                index[self.key(row)] = r
+            else:
+                for c, v in enumerate(row, start=1):
+                    ws.cell(r, c).value = v
+            for c in range(5, len(self.headers) + 1):
+                cell = ws.cell(r, c)
+                color = self.FILLS.get(str(cell.value))
+                cell.fill = PatternFill("solid", fgColor=color) if color else PatternFill()
+        tmp = self.path.with_name(self.path.stem + ".tmp" + self.path.suffix)
+        try:
+            wb.save(tmp)
+            os.replace(tmp, self.path)          # raises PermissionError while Excel has the file open
+        finally:
+            if tmp.exists():
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+
+    def _upsert_csv(self, rows: list[list[Any]]) -> None:
+        data: list[list[str]] = []
+        if self.path.exists():
+            with self.path.open("r", encoding="utf-8-sig", newline="") as fh:
+                data = list(csv.reader(fh))
+            if not data or data[0] != self.headers:
+                self._rotate()
+                data = []
+        if not data:
+            data = [list(self.headers)]
+        index = {self.key(r): i for i, r in enumerate(data) if i > 0 and len(r) >= 4}
+        for row in rows:
+            row = ["" if v is None else str(v) for v in row]
+            i = index.get(self.key(row))
+            if i is None:
+                data.append(row)
+                index[self.key(row)] = len(data) - 1
+            else:
+                data[i] = row
+        tmp = self.path.with_name(self.path.stem + ".tmp" + self.path.suffix)
+        try:
+            with tmp.open("w", encoding="utf-8-sig", newline="") as fh:   # BOM so Excel reads UTF-8
+                csv.writer(fh).writerows(data)
+            os.replace(tmp, self.path)
+        finally:
+            if tmp.exists():
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+
+
+class GoogleSheet:
+    """Sends rows to an Apps Script web app that upserts them into the Google Sheet."""
+    label = "Google Sheet"
+    is_google = True
+
+    def __init__(self, url: str, token: str, headers: list[str]) -> None:
+        self.url, self.token, self.headers = url.strip(), token.strip(), headers
+
+    @staticmethod
+    def valid_url(url: str) -> bool:
+        return (not REQUIRE_HTTPS) or (url.strip().startswith(GOOGLE_WEBAPP_PREFIX) and url.strip().endswith("/exec"))
+
+    def _post(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if not self.valid_url(self.url):
+            raise RuntimeError("not an Apps Script web-app URL (must end with /exec)")
+        body = json.dumps({"token": self.token, **payload}, ensure_ascii=False).encode("utf-8")
+        req = urllib.request.Request(self.url, data=body, method="POST",
+                                     headers={"Content-Type": "text/plain; charset=utf-8"})
+        # Apps Script answers a POST with a redirect; urllib follows it with a GET and gets the JSON reply.
+        with urllib.request.urlopen(req, timeout=30) as r:
+            text = r.read().decode("utf-8", "replace")
+        try:
+            res = json.loads(text)
+        except ValueError:
+            raise RuntimeError("unexpected reply (is the web app deployed with access 'Anyone'?)") from None
+        if not res.get("ok"):
+            raise RuntimeError(str(res.get("error") or "rejected by the script"))
+        return res
+
+    def ping(self) -> None:
+        self._post({"ping": True})
+
+    def upsert(self, rows: list[list[Any]]) -> None:
+        self._post({"headers": self.headers, "rows": rows})
+
+
+# --------------------------------------------------------------------------- #
+# Manager: owns the overlay, toasts, operators/cases, tray icon, sheet and persistence
 # --------------------------------------------------------------------------- #
 class Manager(QObject):
+    sheet_result = pyqtSignal(object, str)      # (rows, error) from the background upload thread
+
     def __init__(self) -> None:
         super().__init__()
         self.path = state_file_path()
         state = load_state(self.path)
         self.opacity = self._clean_opacity(state.get("opacity", DEFAULT_OPACITY))
+        self.hide_judged = bool(state.get("hide_judged", False))
         self.overlay = Overlay()
-        self.toasts: list[Toast] = []
-        self.hint_toast: Toast | None = None
         self.visible_all = True
         self.update_ready: str | None = None
-        self.check_history: list[Toast] = []       # toasts ticked via hotkey (for undo)
+        self.history: list[int] = []                 # item ids judged in this case (for undo)
+        self.pending_rows: dict[tuple[str, str, str], list[Any]] = {}
+        self._last_rows: dict[tuple[str, str, str], tuple] = {}
+        self._last_sheet_warn = 0.0
         self._mask_blocked = False
-        self.origin: QPoint | None = None          # where the auto-stack starts (moved by Shift+drag)
+        self.origin: QPoint | None = None            # where the auto-stack starts (moved by Shift+drag)
         o = state.get("origin")
         if isinstance(o, list) and len(o) == 2:
             try:
@@ -760,6 +1036,28 @@ class Manager(QObject):
                 if isinstance(v, str) and parse_hotkey(v):
                     self.hotkeys[k] = v
 
+        self.checklist = self._load_checklist(state)
+        self.operators = self._load_operators(state)
+        cur = state.get("current") if isinstance(state.get("current"), dict) else {}
+        self.cur_op: str | None = cur.get("operator") if cur.get("operator") in self.operators \
+            else next(iter(self.operators), None)
+        self.cur_case: str | None = None
+        if self.cur_op:
+            cases = self.operators[self.cur_op]["cases"]
+            want = cur.get("case") if cur.get("operator") == self.cur_op else None
+            self.cur_case = want if want in cases else self.operators[self.cur_op].get("last_case")
+        gcfg = state.get("google_sheet") if isinstance(state.get("google_sheet"), dict) else {}
+        self.sheet_cfg: dict[str, str] = {k: str(gcfg.get(k) or "").strip() for k in ("url", "token")}
+        self.sheet = self._make_sheet()
+        self._flushing = False
+        self._flush_thread: threading.Thread | None = None
+        self.sheet_result.connect(self._on_sheet_result)
+        # rows that could not be sent last time (offline / file locked) are retried
+        n_cols = len(ResultsSheet.make_headers([c["text"] for c in self.checklist]))
+        for r in state.get("pending_rows") or []:
+            if isinstance(r, list) and len(r) == n_cols:
+                self.pending_rows[ResultsSheet.key(r)] = r
+
         self._save_timer = QTimer(self)
         self._save_timer.setSingleShot(True)
         self._save_timer.setInterval(400)
@@ -769,6 +1067,11 @@ class Manager(QObject):
         self._top_timer.setInterval(1000)
         self._top_timer.timeout.connect(self.overlay.keep_on_top)
         self._top_timer.start()
+
+        self._sheet_timer = QTimer(self)             # retry if the sheet was locked (open in Excel)
+        self._sheet_timer.setInterval(15000)
+        self._sheet_timer.timeout.connect(self.flush_sheet)
+        self._sheet_timer.start()
 
         self.tray: QSystemTrayIcon | None = None
         if QSystemTrayIcon.isSystemTrayAvailable():
@@ -789,13 +1092,21 @@ class Manager(QObject):
         self._update_timer.timeout.connect(self.updater.check)
         self._update_timer.start()
 
-        # global hotkeys
+        # global hotkeys (ignored while a dialog is open)
         self.hk = HotkeyFilter()
         QApplication.instance().installNativeEventFilter(self.hk)
+        bindings = (
+            ("pass", lambda: self.hotkey_judge("pass")),
+            ("fail", lambda: self.hotkey_judge("fail")),
+            ("undo", self.undo),
+            ("next_case", self.next_case),
+            ("toggle_visible", self.toggle_visible),
+            ("reset", self.reset_case),
+        )
         failed = []
-        for name, fn in (("check_next", self.check_next), ("undo", self.undo_check),
-                         ("toggle_visible", self.toggle_visible), ("reset", self.reset_all)):
-            if not self.hk.register(self.hotkeys[name], fn):
+        for name, fn in bindings:
+            guarded = (lambda f=fn: None if MODAL[0] else f())
+            if not self.hk.register(self.hotkeys[name], guarded):
                 failed.append(pretty_hotkey(self.hotkeys[name]))
         if failed and sys.platform == "win32":
             QTimer.singleShot(2000, lambda: self._notify(
@@ -806,20 +1117,22 @@ class Manager(QObject):
         gui.screenAdded.connect(self.on_screens_changed)
         gui.screenRemoved.connect(self.on_screens_changed)
 
-        self._load_items(state)
-        self._update_hint()
-        self.restack()
+        positions = state.get("positions") if isinstance(state.get("positions"), dict) else {}
+        self.header = Toast(self, "header", "header", pos=self._pos_from(positions, "header"))
+        self.toasts = [
+            Toast(self, "item", c["id"], c["text"], i + 1, self._pos_from(positions, str(c["id"])))
+            for i, c in enumerate(self.checklist)
+        ]
+        self.refresh_all()
         self.overlay.show()
         for t in self._all_toasts():
             if not t.isHidden():
                 t.fade_in()
         self.refresh_mask()
-        self._update_status()
+        QTimer.singleShot(700, self._startup_prompt)
+        QTimer.singleShot(3000, self.flush_sheet)
 
-    # ------------------------------------------------------------------ data #
-    def _all_toasts(self) -> list[Toast]:
-        return self.toasts + ([self.hint_toast] if self.hint_toast else [])
-
+    # ------------------------------------------------------------ loading #
     @staticmethod
     def _clean_opacity(v: Any) -> int:
         try:
@@ -831,50 +1144,501 @@ class Manager(QObject):
     def _on_screen(x: int, y: int) -> bool:
         return any(s.availableGeometry().contains(QPoint(x + 40, y + 20)) for s in QApplication.screens())
 
-    def _load_items(self, state: dict[str, Any]) -> None:
-        raw = state.get("items")
-        entries: list[dict[str, Any]] = []
+    def _pos_from(self, positions: dict, key: str) -> tuple[int, int] | None:
+        p = positions.get(key)
+        if isinstance(p, list) and len(p) == 2:
+            try:
+                x, y = int(p[0]), int(p[1])
+                if self._on_screen(x, y):
+                    return (x, y)
+            except (TypeError, ValueError):
+                pass
+        return None
+
+    @staticmethod
+    def _load_checklist(state: dict[str, Any]) -> list[dict[str, Any]]:
+        """Checklist = [{"id": n, "text": "..."}]. Plain strings in the JSON list are accepted too."""
+        items: list[dict[str, Any]] = []
+        raw = state.get("checklist")
         if isinstance(raw, list):
-            entries = [e for e in raw if isinstance(e, dict)
-                       and isinstance(e.get("text"), str) and e["text"].strip()]
-        if not isinstance(raw, list):               # first run: defaults (an empty saved list stays empty)
-            entries = [{"text": t} for t in DEFAULT_ITEMS]
-        for e in entries:
-            pos = None
-            p = e.get("pos")
-            if isinstance(p, list) and len(p) == 2:
-                try:
-                    x, y = int(p[0]), int(p[1])
-                    if self._on_screen(x, y):
-                        pos = (x, y)
-                except (TypeError, ValueError):
-                    pass
-            t = Toast(self, e["text"].strip(), bool(e.get("checked", False)), pos)
-            if t.checked and e.get("hidden"):          # only ticked items may stay hidden
-                t.hide()
-            self.toasts.append(t)
+            used = {int(e["id"]) for e in raw if isinstance(e, dict) and str(e.get("id", "")).isdigit()}
+            nxt = max(used, default=0) + 1
+            for e in raw:
+                if isinstance(e, dict) and str(e.get("text", "")).strip():
+                    try:
+                        cid = int(e.get("id"))
+                    except (TypeError, ValueError):
+                        cid, nxt = nxt, nxt + 1
+                    if all(i["id"] != cid for i in items):
+                        items.append({"id": cid, "text": str(e["text"]).strip()})
+                elif isinstance(e, str) and e.strip():
+                    items.append({"id": nxt, "text": e.strip()})
+                    nxt += 1
+        if not items:
+            items = [{"id": i + 1, "text": t} for i, t in enumerate(DEFAULT_CHECKLIST)]
+        return items
+
+    @staticmethod
+    def _load_operators(state: dict[str, Any]) -> dict[str, dict[str, Any]]:
+        ops: dict[str, dict[str, Any]] = {}
+        raw = state.get("operators")
+        if not isinstance(raw, dict):
+            return ops
+        for name, od in raw.items():
+            if not isinstance(od, dict) or not str(name).strip():
+                continue
+            cases: dict[str, dict[str, Any]] = {}
+            rc = od.get("cases")
+            if isinstance(rc, dict):
+                for cn, cd in rc.items():
+                    if not isinstance(cd, dict):
+                        continue
+                    st = cd.get("status") if isinstance(cd.get("status"), dict) else {}
+                    cases[str(cn)] = {
+                        "date": str(cd.get("date") or ""),
+                        "status": {str(k): v for k, v in st.items() if v in ("pass", "fail")},
+                        "updated": str(cd.get("updated") or ""),
+                        "in_sheet": bool(cd.get("in_sheet", False)),
+                    }
+            last = od.get("last_case")
+            ops[str(name)] = {"cases": cases, "last_case": last if last in cases else None}
+        return ops
 
     def save(self) -> None:
         o = self.origin
+        positions = {str(t.key): [t.global_pos().x(), t.global_pos().y()]
+                     for t in self._all_toasts() if t.custom_pos}
         data = {
-            "version": 4,
+            "version": 5,
             "opacity": self.opacity,
+            "hide_judged": self.hide_judged,
             "origin": [o.x(), o.y()] if o is not None else None,
             "hotkeys": self.hotkeys,
-            "items": [
-                {
-                    "text": t.text,
-                    "checked": t.checked,
-                    "hidden": t.isHidden(),
-                    "pos": [t.global_pos().x(), t.global_pos().y()] if t.custom_pos else None,
-                }
-                for t in self.toasts
-            ],
+            "checklist": self.checklist,
+            "operators": self.operators,
+            "current": {"operator": self.cur_op, "case": self.cur_case},
+            "positions": positions,
+            "google_sheet": self.sheet_cfg,
+            "pending_rows": list(self.pending_rows.values()),
         }
         save_state(self.path, data)
 
     def schedule_save(self) -> None:
         self._save_timer.start()
+
+    def _all_toasts(self) -> list[Toast]:
+        return [self.header] + self.toasts
+
+    # ----------------------------------------------------------- case data #
+    def current_case(self) -> dict[str, Any] | None:
+        if self.cur_op and self.cur_case:
+            return self.operators.get(self.cur_op, {}).get("cases", {}).get(self.cur_case)
+        return None
+
+    def case_counts(self, case: dict[str, Any]) -> tuple[int, int, int, int]:
+        """(judged, passed, failed, total) for the current checklist."""
+        ids = {str(c["id"]) for c in self.checklist}
+        st = case["status"]
+        passed = sum(1 for i in ids if st.get(i) == "pass")
+        failed = sum(1 for i in ids if st.get(i) == "fail")
+        return passed + failed, passed, failed, len(ids)
+
+    def _is_complete(self, case: dict[str, Any]) -> bool:
+        j, _, _, total = self.case_counts(case)
+        return j == total
+
+    def first_unjudged(self) -> Toast | None:
+        case = self.current_case()
+        if case is None:
+            return None
+        return next((t for t in self.toasts if str(t.key) not in case["status"]), None)
+
+    def _case_icon(self, case: dict[str, Any]) -> str:
+        j, _, f, total = self.case_counts(case)
+        if j == total:
+            return "✗" if f else "✓"
+        return "◐" if j else "○"
+
+    # ---------------------------------------------------------- refreshing #
+    def _header_info(self) -> tuple[str, str]:
+        dim = "<span style='color:#9aa0a6;font-size:11px'>"
+        if self.cur_op is None:
+            return "none", "<b>No operator yet</b><br>" + dim + "Click here to create one</span>"
+        op = html.escape(self.cur_op)
+        top = f"{dim}OPERATOR</span>&nbsp;&nbsp;<b>{op}</b>"
+        case = self.current_case()
+        if case is None:
+            return "none", top + "<br>" + dim + "No case yet. Click here to add cases</span>"
+        j, _, f, total = self.case_counts(case)
+        line = f"{dim}CASE</span>&nbsp;&nbsp;<b style='color:#8ab4f8'>{html.escape(self.cur_case or '')}</b>"
+        line += f"&nbsp;&nbsp;·&nbsp;&nbsp;{j}/{total}"
+        if f:
+            line += f"&nbsp;&nbsp;·&nbsp;&nbsp;<span style='color:#f28b82'>{f} failed</span>"
+        state = "progress"
+        if j == total:
+            state = "fail" if f else "pass"
+            line += ("&nbsp;&nbsp;·&nbsp;&nbsp;<b style='color:#f28b82'>FAIL ✗</b>" if f
+                     else "&nbsp;&nbsp;·&nbsp;&nbsp;<b style='color:#81c995'>PASS ✓</b>")
+        return state, top + "<br>" + line
+
+    def refresh_all(self) -> None:
+        """Re-sync every toast with the current operator/case, then re-stack."""
+        case = self.current_case()
+        first = self.first_unjudged()
+        for t in self.toasts:
+            st = case["status"].get(str(t.key)) if case else None
+            t.set_status(st)
+            t.set_current(case is not None and t is first)
+            hide = self.hide_judged and st is not None
+            if hide != t.isHidden():
+                t.setVisible(not hide)
+        state, text = self._header_info()
+        self.header.set_info(text, state)
+        if self.tray:
+            if case:
+                j, _, _, total = self.case_counts(case)
+                self.tray.setToolTip(f"{APP_TITLE}: {self.cur_op} / {self.cur_case}  {j}/{total}")
+            else:
+                self.tray.setToolTip(APP_TITLE)
+        self.restack()
+
+    def _notify(self, msg: str) -> None:
+        if self.tray:
+            self.tray.showMessage(APP_TITLE, msg, QSystemTrayIcon.MessageIcon.Information, 4000)
+        else:
+            print(f"[info] {msg}")
+
+    # ---------------------------------------------------------- judgments #
+    def _ensure_case(self) -> dict[str, Any] | None:
+        """Make sure there is a current operator + case (asks the user if not)."""
+        if self.cur_op is None:
+            self.new_operator()
+        elif self.cur_case is None:
+            self.add_cases()
+        return self.current_case()
+
+    def set_status(self, item_id: Any, value: str | None, record: bool = True) -> None:
+        case = self.current_case() or self._ensure_case()
+        if case is None:
+            return
+        was_complete = self._is_complete(case)
+        key = str(item_id)
+        if value is None:
+            case["status"].pop(key, None)
+        else:
+            case["status"][key] = value
+            if not case.get("date"):
+                case["date"] = today_str()
+            if record:
+                self.history.append(int(item_id))
+        case["updated"] = now_iso()
+        j, _, f, total = self.case_counts(case)
+        if j == total or case.get("in_sheet"):
+            self._queue_row(self.cur_op, self.cur_case, case)
+        self.refresh_all()
+        self.schedule_save()
+        if j == total and not was_complete:
+            self._notify(f"Case {self.cur_case}: " + (f"FAIL ✗ ({f} failed)" if f else "PASS ✓")
+                         + f" · saving to {self.sheet.label}…")
+
+    def toggle_status(self, item_id: Any, value: str) -> None:
+        """Clicking the active button clears it; clicking the other one switches."""
+        case = self.current_case() or self._ensure_case()
+        if case is None:
+            return
+        cur = case["status"].get(str(item_id))
+        self.set_status(item_id, None if cur == value else value)
+
+    def hotkey_judge(self, value: str) -> None:
+        """Hotkey: Pass/Fail the next unjudged item."""
+        if (self.current_case() or self._ensure_case()) is None:
+            return
+        nxt = self.first_unjudged()
+        if nxt is None:
+            self._notify("All items judged. Press " + pretty_hotkey(self.hotkeys["next_case"])
+                         + " for the next case.")
+            return
+        self.set_status(nxt.key, value)
+
+    def undo(self) -> None:
+        """Hotkey: clear the most recent judgment of this case."""
+        case = self.current_case()
+        if case is None:
+            return
+        target = None
+        while self.history:
+            i = self.history.pop()
+            if str(i) in case["status"]:
+                target = i
+                break
+        if target is None:                                   # fallback: last judged item in the list
+            target = next((t.key for t in reversed(self.toasts) if str(t.key) in case["status"]), None)
+        if target is not None:
+            self.set_status(target, None, record=False)
+
+    def reset_case(self) -> None:
+        """Clear every judgment of the current case (asks first if something was judged)."""
+        case = self.current_case()
+        if case is None:
+            return
+        if case["status"] and not confirm("Reset case", f"Clear all Pass/Fail marks of case {self.cur_case}?"):
+            return
+        case["status"].clear()
+        case["updated"] = now_iso()
+        self.history.clear()
+        if case.get("in_sheet"):
+            self._queue_row(self.cur_op, self.cur_case, case)
+        self.refresh_all()
+        self.schedule_save()
+
+    # ----------------------------------------------- operators and cases #
+    def _leave_case(self) -> None:
+        """Before switching away / quitting: store a partial case in the sheet as INCOMPLETE."""
+        case = self.current_case()
+        if case is not None and (self.case_counts(case)[0] or case.get("in_sheet")):
+            self._queue_row(self.cur_op, self.cur_case, case)
+
+    def _startup_prompt(self) -> None:
+        if not self.operators:
+            self.new_operator()
+
+    def new_operator(self) -> None:
+        name = ask_text("New operator", "Operator name:")
+        if not name:
+            return
+        existing = next((n for n in self.operators if n.lower() == name.lower()), None)
+        if existing is None:
+            self.operators[name] = {"cases": {}, "last_case": None}
+            existing = name
+        self.switch_operator(existing)
+        if not self.operators[existing]["cases"]:
+            self.add_cases()
+
+    def switch_operator(self, name: str) -> None:
+        if name not in self.operators:
+            return
+        self._leave_case()
+        self.cur_op = name
+        od = self.operators[name]
+        pick = od.get("last_case")
+        if pick not in od["cases"]:
+            pick = next((n for n, c in od["cases"].items() if not self._is_complete(c)),
+                        next(iter(od["cases"]), None))
+        self.cur_case = pick
+        self.history.clear()
+        self.refresh_all()
+        self.schedule_save()
+
+    def set_case(self, case_no: str) -> None:
+        if self.cur_op is None or case_no not in self.operators[self.cur_op]["cases"]:
+            return
+        self._leave_case()
+        self.cur_case = case_no
+        self.operators[self.cur_op]["last_case"] = case_no
+        self.history.clear()
+        self.refresh_all()
+        self.schedule_save()
+
+    def add_cases(self) -> None:
+        """Add one or several case numbers to the current operator (paste a whole list if you like)."""
+        if self.cur_op is None:
+            self.new_operator()
+            return
+        text = ask_multiline("Add cases", f"Case numbers for {self.cur_op}\n"
+                             "(one per line, or separated by commas / spaces):")
+        nums = list(dict.fromkeys(n for n in re.split(r"[,;\s]+", text or "") if n))
+        if not nums:
+            return
+        cases = self.operators[self.cur_op]["cases"]
+        new = [n for n in nums if n not in cases]
+        for n in new:
+            cases[n] = {"date": "", "status": {}, "updated": "", "in_sheet": False}
+        self.set_case(new[0] if new else nums[0])
+        if len(new) > 1:
+            self._notify(f"{len(new)} cases added for {self.cur_op}")
+
+    def next_case(self) -> None:
+        """Hotkey: go to the operator's next unfinished case (or ask for new case numbers)."""
+        if self.cur_op is None:
+            self.new_operator()
+            return
+        cases = self.operators[self.cur_op]["cases"]
+        if not cases:
+            self.add_cases()
+            return
+        names = list(cases)
+        start = names.index(self.cur_case) if self.cur_case in cases else -1
+        for n in names[start + 1:] + names[:start + 1]:
+            if n != self.cur_case and not self._is_complete(cases[n]):
+                self.set_case(n)
+                self._notify(f"Next case: {n}")
+                return
+        self._notify(f"All cases of {self.cur_op} are done. Add more case numbers.")
+        self.add_cases()
+
+    def delete_case(self) -> None:
+        if self.cur_op is None or self.cur_case is None:
+            return
+        if not confirm("Delete case", f"Delete case {self.cur_case} of {self.cur_op}?\n"
+                       "(Rows already saved in the sheet stay there.)"):
+            return
+        od = self.operators[self.cur_op]
+        names = list(od["cases"])
+        i = names.index(self.cur_case)
+        del od["cases"][self.cur_case]
+        rest = list(od["cases"])
+        self.cur_case = rest[min(i, len(rest) - 1)] if rest else None
+        od["last_case"] = self.cur_case
+        self.history.clear()
+        self.refresh_all()
+        self.schedule_save()
+
+    def delete_operator(self) -> None:
+        if self.cur_op is None:
+            return
+        if not confirm("Delete operator", f"Delete operator {self.cur_op} and all their cases?\n"
+                       "(Rows already saved in the sheet stay there.)"):
+            return
+        del self.operators[self.cur_op]
+        self.cur_op = next(iter(self.operators), None)
+        self.cur_case = self.operators[self.cur_op].get("last_case") if self.cur_op else None
+        self.history.clear()
+        self.refresh_all()
+        self.schedule_save()
+
+    # --------------------------------------------------------------- sheet #
+    def _build_row(self, op: str, case_no: str, case: dict[str, Any]) -> list[Any]:
+        j, p, f, total = self.case_counts(case)
+        result = "INCOMPLETE" if j < total else ("FAIL" if f else "PASS")
+        stamp = case.get("updated") or now_iso()
+        cells = [{"pass": "Pass", "fail": "Fail"}.get(case["status"].get(str(c["id"])), "")
+                 for c in self.checklist]
+        return [case.get("date") or today_str(), stamp[11:19] or datetime.now().strftime("%H:%M:%S"),
+                op, case_no, *cells, p, f, result]
+
+    def _queue_row(self, op: str | None, case_no: str | None, case: dict[str, Any]) -> None:
+        if not op or not case_no:
+            return
+        row = self._build_row(op, case_no, case)
+        key = ResultsSheet.key(row)
+        case["in_sheet"] = True
+        if self._last_rows.get(key) == tuple(row[2:]) and key not in self.pending_rows:
+            return                                    # nothing changed since the last write
+        self.pending_rows[key] = row
+        self.flush_sheet()
+
+    def _make_sheet(self):
+        texts = [c["text"] for c in self.checklist]
+        if self.sheet_cfg.get("url") and self.sheet_cfg.get("token"):
+            return GoogleSheet(self.sheet_cfg["url"], self.sheet_cfg["token"], ResultsSheet.make_headers(texts))
+        return ResultsSheet(app_dir(), texts)
+
+    def flush_sheet(self) -> None:
+        """Send pending rows in a background thread (never blocks the toasts / hotkeys)."""
+        if not self.pending_rows or self._flushing:
+            return
+        self._flushing = True
+        rows = list(self.pending_rows.values())
+        self._flush_thread = threading.Thread(target=self._flush_worker, args=(self.sheet, rows), daemon=True)
+        self._flush_thread.start()
+
+    def _flush_worker(self, sheet, rows: list[list[Any]]) -> None:
+        err = ""
+        try:
+            sheet.upsert(rows)
+        except PermissionError:
+            err = "the file is open in Excel. Close it"
+        except Exception as exc:
+            err = str(exc) or exc.__class__.__name__
+        self.sheet_result.emit(rows, err)
+
+    @pyqtSlot(object, str)
+    def _on_sheet_result(self, rows: list[list[Any]], err: str) -> None:
+        self._flushing = False
+        if err:
+            print(f"[warn] sheet upload failed: {err}", file=sys.stderr)
+            if time.monotonic() - self._last_sheet_warn > 60:
+                self._last_sheet_warn = time.monotonic()
+                self._notify(f"Could not save to {self.sheet.label}: {err}. Will retry automatically.")
+            self.schedule_save()                  # keep the unsent rows on disk
+            return
+        for r in rows:
+            key = ResultsSheet.key(r)
+            if self.pending_rows.get(key) == r:
+                del self.pending_rows[key]
+            self._last_rows[key] = tuple(r[2:])
+        self.schedule_save()
+        if self.pending_rows:
+            QTimer.singleShot(0, self.flush_sheet)  # rows added while uploading
+
+    def _final_flush(self) -> None:
+        """On quit: wait for a running upload, then try once more; leftovers stay in the state file."""
+        t = self._flush_thread
+        if t is not None and t.is_alive():
+            t.join(12)
+        QApplication.processEvents()
+        if self.pending_rows:
+            rows = list(self.pending_rows.values())
+            try:
+                self.sheet.upsert(rows)
+                self.pending_rows.clear()
+            except Exception as exc:
+                print(f"[warn] final upload failed: {exc}", file=sys.stderr)
+
+    def open_sheet(self) -> None:
+        if self.sheet.is_google:
+            QDesktopServices.openUrl(QUrl(GOOGLE_SHEET_URL))
+        elif self.sheet.path.exists():
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.sheet.path)))
+        else:
+            self._notify("No results yet. A row is saved when a case is completed.")
+
+    def connect_google(self) -> None:
+        """Ask for the Apps Script web-app URL + secret, test them, then use the Google Sheet."""
+        url = ask_text("Connect Google Sheet",
+                       "Paste the Web app URL from Apps Script (it ends with /exec):", self.sheet_cfg.get("url", ""))
+        if not url:
+            return
+        if not GoogleSheet.valid_url(url):
+            info("Connect Google Sheet", "That doesn't look like a Web app URL.\n"
+                 "It should start with https://script.google.com/macros/s/ and end with /exec")
+            return
+        token = ask_text("Connect Google Sheet", "Secret (the SECRET text you set in the script):",
+                         self.sheet_cfg.get("token", ""))
+        if not token:
+            return
+        candidate = GoogleSheet(url, token, ResultsSheet.make_headers([c["text"] for c in self.checklist]))
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            candidate.ping()
+        except Exception as exc:
+            QApplication.restoreOverrideCursor()
+            info("Connect Google Sheet", f"Could not connect:\n{exc}")
+            return
+        QApplication.restoreOverrideCursor()
+        self.sheet_cfg = {"url": url.strip(), "token": token.strip()}
+        self.sheet = candidate
+        self._last_rows.clear()
+        self.schedule_save()
+        self._notify("Google Sheet connected ✓")
+        n = sum(1 for od in self.operators.values() for cd in od["cases"].values() if self.case_counts(cd)[0])
+        if n and confirm("Upload existing results", f"Upload {n} existing case(s) to the Google Sheet now?"):
+            self.upload_all()
+
+    def disconnect_google(self) -> None:
+        if confirm("Google Sheet", "Stop using the Google Sheet and save to a local Excel file instead?"):
+            self.sheet_cfg = {"url": "", "token": ""}
+            self.sheet = self._make_sheet()
+            self._last_rows.clear()
+            self.schedule_save()
+
+    def upload_all(self) -> None:
+        """Queue every case that has marks (used right after connecting a sheet)."""
+        for op, od in self.operators.items():
+            for cn, cd in od["cases"].items():
+                if self.case_counts(cd)[0]:
+                    self._queue_row(op, cn, cd)
+        self.flush_sheet()
 
     # ---------------------------------------------------------------- layout #
     def refresh_mask(self) -> None:
@@ -896,14 +1660,10 @@ class Manager(QObject):
             self.origin = None
         o = self._origin()
         x, y = o.x(), o.y()
-        n = 0
         for t in self._all_toasts():
             if reset_custom:
                 t.custom_pos = False
             t.fit()
-            if not t.hint:
-                n += 1                       # numbering counts hidden items too (stable step numbers)
-                t.set_index(n)
             if t.isHidden() or t.custom_pos:
                 continue
             t.place(x, y)
@@ -943,124 +1703,10 @@ class Manager(QObject):
             t.place(p.x(), p.y())
         self.restack()
 
-    def _update_hint(self) -> None:
-        """Placeholder toast: shown when the list is empty, or when everything is ticked + hidden."""
-        want = None
-        if not self.toasts:
-            want = "No QC items.\nRight-click here to add one."
-        elif all(t.checked for t in self.toasts) and all(t.isHidden() for t in self.toasts):
-            want = f"✓ All checks complete\nReset: {pretty_hotkey(self.hotkeys['reset'])} or right-click"
-        if want is None:
-            if self.hint_toast is not None:
-                self.hint_toast.setParent(None)
-                self.hint_toast.deleteLater()
-                self.hint_toast = None
-        elif self.hint_toast is None:
-            self.hint_toast = Toast(self, want, hint=True)
-            self.restack()
-            if self.overlay.isVisible():
-                self.hint_toast.fade_in()
-        else:
-            self.hint_toast.set_text(want)
-
-    def _notify(self, msg: str) -> None:
-        if self.tray:
-            self.tray.showMessage(APP_TITLE, msg, QSystemTrayIcon.MessageIcon.Information, 5000)
-
-    def _update_status(self) -> None:
-        total = len(self.toasts)
-        done = sum(1 for t in self.toasts if t.checked)
-        if self.tray:
-            self.tray.setToolTip(f"{APP_TITLE}: {done}/{total} done")
-
     # --------------------------------------------------------------- actions #
-    def toggle(self, toast: Toast) -> None:
-        toast.set_checked(not toast.checked)
-        self._update_status()
-        self.schedule_save()
-        if self.toasts and all(t.checked for t in self.toasts):
-            self._notify("All checks complete ✓")
-
-    def add_item(self) -> None:
-        text = ask_text("Add QC item", "Check item:")
-        if not text:
-            return
-        t = Toast(self, text)
-        self.toasts.append(t)
-        self._update_hint()
-        self.restack()
-        if self.visible_all:
-            t.fade_in()
-        self._update_status()
-
-    def edit_item(self, toast: Toast) -> None:
-        text = ask_text("Edit QC item", "Check item:", toast.text)
-        if text:
-            toast.set_text(text)
-            self.restack()
-
-    def delete_item(self, toast: Toast) -> None:
-        if toast in self.toasts:
-            self.toasts.remove(toast)
-            toast.setParent(None)        # detach immediately so it leaves the mask/overlay
-            toast.deleteLater()
-            self._update_hint()
-            self.restack()
-            self._update_status()
-
-    def move_item(self, toast: Toast, delta: int) -> None:
-        i = self.toasts.index(toast)
-        j = i + delta
-        if 0 <= j < len(self.toasts):
-            self.toasts[i], self.toasts[j] = self.toasts[j], self.toasts[i]
-            self.restack(reset_custom=True)   # order == stacking order, so re-stack everything
-
-    def check_next(self) -> None:
-        """Hotkey: tick the first unchecked item (in list order) and hide its toast."""
-        nxt = next((t for t in self.toasts if not t.checked), None)
-        if nxt is None:
-            return
-        nxt.set_checked(True)
-        nxt.hide()
-        self.check_history.append(nxt)
-        self._after_hotkey_change()
-
-    def undo_check(self) -> None:
-        """Hotkey: bring back the most recently ticked item (unticked and visible again)."""
-        target = None
-        while self.check_history:
-            cand = self.check_history.pop()
-            if cand in self.toasts and cand.checked:
-                target = cand
-                break
-        if target is None:                                   # fallback: last ticked item in the list
-            target = next((t for t in reversed(self.toasts) if t.checked), None)
-        if target is None:
-            return
-        target.set_checked(False)
-        was_hidden = target.isHidden()
-        target.show()
-        self._after_hotkey_change()
-        if was_hidden and self.overlay.isVisible():
-            target.fade_in()
-
-    def _after_hotkey_change(self) -> None:
-        self._update_hint()
-        self.restack()                       # visible toasts close the gap / re-open the slot
-        self._update_status()
-        if self.toasts and all(t.checked for t in self.toasts):
-            self._notify("All checks complete ✓")
-
-    def reset_all(self) -> None:
-        """Untick everything and show every toast again (next arch)."""
-        self.check_history.clear()
-        for t in self.toasts:
-            t.set_checked(False)
-            if t.isHidden():
-                t.show()
-        self._update_hint()
-        self.restack()
-        self._update_status()
+    def set_hide_judged(self, value: bool) -> None:
+        self.hide_judged = bool(value)
+        self.refresh_all()
         self.schedule_save()
 
     def set_opacity(self, pct: int) -> None:
@@ -1103,6 +1749,8 @@ class Manager(QObject):
                                   QSystemTrayIcon.MessageIcon.Warning, 4000)
 
     def quit(self) -> None:
+        self._leave_case()
+        self._final_flush()
         self.save()
         self.hk.unregister_all()
         if self.tray:
@@ -1115,7 +1763,7 @@ class Manager(QObject):
 
     # ------------------------------------------------------------------ menu #
     def build_menu(self, toast: Toast | None) -> QMenu:
-        """Right-click menu of a toast."""
+        """Right-click / header-click menu."""
         m = QMenu()
         m.setStyleSheet(MENU_STYLE)
         self._fill_menu(m, toast)
@@ -1124,21 +1772,58 @@ class Manager(QObject):
     def _fill_menu(self, m: QMenu, toast: Toast | None) -> None:
         """Populate a menu; rebuilt every time it opens so its state is always fresh."""
         m.clear()
-        if toast is not None and not toast.hint and toast in self.toasts:
-            idx = self.toasts.index(toast)
-            m.addAction("Edit…", lambda: self.edit_item(toast))
-            up = m.addAction("Move up", lambda: self.move_item(toast, -1))
-            up.setEnabled(idx > 0)
-            down = m.addAction("Move down", lambda: self.move_item(toast, 1))
-            down.setEnabled(idx < len(self.toasts) - 1)
-            m.addAction("Delete", lambda: self.delete_item(toast))
-            m.addSeparator()
         hk = {k: pretty_hotkey(v) for k, v in self.hotkeys.items()}
-        m.addAction("➕ Add item…", self.add_item)
-        m.addAction(f"✓ Check next + hide    ({hk['check_next']})", self.check_next)
-        m.addAction(f"↶ Undo last check    ({hk['undo']})", self.undo_check)
-        m.addAction(f"↺ Reset all (untick + show)    ({hk['reset']})", self.reset_all)
-        m.addAction(f"Show / hide toasts    ({hk['toggle_visible']})", self.toggle_visible)
+        if toast is not None and toast.kind == "item":
+            m.addAction("✓ Pass this item", lambda: self.set_status(toast.key, "pass"))
+            m.addAction("✗ Fail this item", lambda: self.set_status(toast.key, "fail"))
+            m.addAction("Clear this item", lambda: self.set_status(toast.key, None))
+            m.addSeparator()
+
+        opm = m.addMenu(f"Operator: {self.cur_op or '(none)'}")
+        for name in self.operators:
+            a = opm.addAction(name)
+            a.setCheckable(True)
+            a.setChecked(name == self.cur_op)
+            a.triggered.connect(lambda _=False, n=name: self.switch_operator(n))
+        if self.operators:
+            opm.addSeparator()
+        opm.addAction("➕ New operator…", lambda: self.new_operator())
+        if self.cur_op:
+            opm.addAction(f"🗑 Delete operator “{self.cur_op}”…", lambda: self.delete_operator())
+
+        cm = m.addMenu(f"Case: {self.cur_case or '(none)'}")
+        if self.cur_op:
+            for cn, cd in self.operators[self.cur_op]["cases"].items():
+                a = cm.addAction(f"{self._case_icon(cd)}  {cn}")
+                a.setCheckable(True)
+                a.setChecked(cn == self.cur_case)
+                a.triggered.connect(lambda _=False, n=cn: self.set_case(n))
+            if self.operators[self.cur_op]["cases"]:
+                cm.addSeparator()
+            cm.addAction("➕ Add case(s)…", lambda: self.add_cases())
+            if self.cur_case:
+                cm.addAction(f"🗑 Delete case “{self.cur_case}”…", lambda: self.delete_case())
+        else:
+            cm.setEnabled(False)
+
+        m.addAction(f"⏭ Next case    ({hk['next_case']})", lambda: self.next_case())
+        m.addSeparator()
+        m.addAction(f"✓ Pass next item    ({hk['pass']})", lambda: self.hotkey_judge("pass"))
+        m.addAction(f"✗ Fail next item    ({hk['fail']})", lambda: self.hotkey_judge("fail"))
+        m.addAction(f"↶ Undo last    ({hk['undo']})", lambda: self.undo())
+        m.addAction(f"↺ Reset this case…    ({hk['reset']})", lambda: self.reset_case())
+        m.addSeparator()
+        m.addAction("📊 Open results sheet", lambda: self.open_sheet())
+        if self.sheet.is_google:
+            m.addAction("☁ Google Sheet: connected ✓   (change…)", lambda: self.connect_google())
+            m.addAction("Stop using Google Sheet…", lambda: self.disconnect_google())
+        else:
+            m.addAction("☁ Connect Google Sheet…", lambda: self.connect_google())
+        m.addAction(f"Show / hide toasts    ({hk['toggle_visible']})", lambda: self.toggle_visible())
+        hj = m.addAction("Hide judged toasts")
+        hj.setCheckable(True)
+        hj.setChecked(self.hide_judged)
+        hj.triggered.connect(lambda checked: self.set_hide_judged(checked))
         m.addAction("Re-stack toasts (default place)", lambda: self.restack(reset_custom=True, reset_origin=True))
         m.addAction("Tip: Shift + drag = move all toasts").setEnabled(False)
 
@@ -1154,11 +1839,11 @@ class Manager(QObject):
 
         m.addSeparator()
         if self.update_ready:
-            m.addAction(f"⟳ Restart to update to v{self.update_ready}", self.apply_update)
+            m.addAction(f"⟳ Restart to update to v{self.update_ready}", lambda: self.apply_update())
         else:
             m.addAction("Check for updates", lambda: self.updater.check(manual=True))
         m.addAction(f"Version {APP_VERSION}").setEnabled(False)
-        m.addAction("Quit", self.quit)
+        m.addAction("Quit", lambda: self.quit())
 
 
 # --------------------------------------------------------------------------- #
@@ -1166,12 +1851,18 @@ TOAST_STYLE = """
 QWidget { font-family: "Segoe UI", "Noto Sans", "DejaVu Sans", sans-serif; }
 QFrame { background: transparent; border: none; }
 #card { background-color: #1e2127; border: 1px solid #3a3f4b; border-left: 4px solid #4a90d9; border-radius: 8px; }
-#card[done="true"] { border-left-color: #34a853; background-color: #1b2420; }
+#card[kind="header"] { background-color: #202733; border-left-color: #8ab4f8; }
+#card[kind="header"][state="pass"] { background-color: #1b2420; border-left-color: #34a853; }
+#card[kind="header"][state="fail"] { background-color: #2a1b1d; border-left-color: #ea4335; }
+#card[kind="item"][state="pass"] { background-color: #1b2420; border-left-color: #34a853; }
+#card[kind="item"][state="fail"] { background-color: #2a1b1d; border-left-color: #ea4335; }
+#card[kind="item"][current="true"] { border: 1px solid #fbbc04; border-left: 4px solid #fbbc04; }
 #num { color: #6b7280; font-size: 11px; font-weight: 600; background: transparent; border: none; }
 #text { color: #f1f3f4; font-size: 14px; background: transparent; border: none; }
-#text[done="true"] { color: #8d9399; }
-#box { border: 1.5px solid #6b7280; border-radius: 5px; background: #14161a; color: white; font-size: 14px; font-weight: bold; }
-#box[done="true"] { background: #34a853; border-color: #34a853; }
+#pbtn, #fbtn { border: 1.5px solid #5f6672; border-radius: 6px; background: #14161a; color: #7b828c;
+               font-size: 15px; font-weight: bold; }
+#pbtn[active="true"] { background: #34a853; border-color: #34a853; color: white; }
+#fbtn[active="true"] { background: #ea4335; border-color: #ea4335; color: white; }
 """
 
 MENU_STYLE = """
